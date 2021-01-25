@@ -3,6 +3,7 @@
 #include <signal.h>
 #include <android/log.h>
 #include <libunwind-aarch64.h>
+#include <dlfcn.h>
 
 
 #define TAG "crash_sdk_jni" // 这个是自定义的LOG的标识
@@ -31,27 +32,45 @@ static const int sig_arr[SIG_CATCH_COUNT] = {SIGABRT,  //进程发现错误或�
                                              SIGSEGV}; //段地址错误，比如空指针、数组越界、野指针等
 
 
- /**
-  * 使用unwind解析堆栈
-  * @param buffer
-  * @param size
-  * @param uc
-  * @return
-  */
-static int slow_backtrace(void **buffer, int size, unw_context_t *uc) {
+/**
+ * 使用unwind解析堆栈
+ * @param buffer
+ * @param size
+ * @param uc
+ * @return
+ */
+static int slow_backtrace(unw_word_t **buffer, int size, unw_context_t *uc) {
     unw_cursor_t cursor;
-    unw_word_t ip;
+    unw_word_t pc;
     int n = 0;
 
+    LOGE("开始slow_backtrace");
     if (unw_init_local(&cursor, uc) < 0)
         return 0;
+    LOGE("unw_init_local 初始化成功");
 
     while (unw_step(&cursor) > 0) {
+        LOGE("unw_step 成功");
         if (n >= size)
             return n;
-        if (unw_get_reg(&cursor, UNW_REG_IP, &ip) < 0)
+        if (unw_get_reg(&cursor, UNW_REG_IP, &pc) < 0)
             return n;
-        buffer[n++] = (void *) (uintptr_t) ip;
+        //尝试获取动态库的信息
+        Dl_info info;
+        dladdr ((void*)pc, &info);
+        LOGE("dladdr获取动态库的名字：%s", info.dli_fname);
+
+//        Dl_info info;
+//        unw_word_t *addr = &pc;
+//        if (dladdr(addr, &info) != 0) {
+//            LOGE("dladdr获取成功，动态库的名字：%s", info.dli_fname);
+//
+//        } else{
+//            char* err_msg = dlerror();
+//            LOGE("dladdr获取失败，信息:%s", err_msg);
+//        }
+        LOGE("unw_get_reg 成功");
+        buffer[n++] = &pc;
     }
     return n;
 }
@@ -237,25 +256,39 @@ static const char *sig_desc(int sig, int code) {
  * @param siginfo
  * @param sc
  */
-static void sig_handler(const int code, siginfo *siginfo, void *sc) {
+static void sig_handler(const int code, siginfo *siginfo, void *context) {
+
 
     LOGE("收到信号对应的code:%d, si_code:%d，错误信息：%s", code, siginfo->si_code,
          sig_desc(code, siginfo->si_code));
     //开始我们自己的信号处理
-    void *buf[20];
+    unw_word_t *buf[20];
     unw_context_t uc;
     unw_getcontext (&uc);
 
     int n = slow_backtrace(buf, 20, &uc);
+    //据pc的值，获取动态库的起始地址
+
 
     //据code找到之前的信号处理
     struct sigaction old_sig_act = p_sa_old[code];
     //调用之前的处理
-    old_sig_act.sa_sigaction(code, siginfo, sc);
+    LOGE("调用之前的信号处理");
+    old_sig_act.sa_sigaction(code, siginfo, context);
+
 }
 
 //注册信号的处理
 static int register_crash_handler() {
+    //为信号处理函数注册一个栈
+    stack_t stack;
+    memset(&stack, 0, sizeof(stack));
+    stack.ss_size = SIGSTKSZ;
+    stack.ss_sp = malloc(stack.ss_size);
+    stack.ss_flags = 0;
+    if (stack.ss_sp == NULL || sigaltstack(&stack, NULL) != 0) {
+        return ERROR;
+    }
     //需要捕获的信号
     //定义信号对应的处理结构体sigaction
     struct sigaction sa;

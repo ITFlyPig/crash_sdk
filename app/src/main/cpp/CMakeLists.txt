@@ -1,44 +1,56 @@
-# For more information about using CMake with Android Studio, read the
-# documentation: https://d.android.com/studio/projects/add-native-code.html
-
-# Sets the minimum version of CMake required to build the native library.
-
 cmake_minimum_required(VERSION 3.4.1)
 
-# Creates and names a library, sets it as either STATIC
-# or SHARED, and provides the relative paths to its source code.
-# You can define multiple libraries, and CMake builds them for you.
-# Gradle automatically packages shared libraries with your APK.
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11")
 
-add_library( # Sets the name of the library.
-             native-lib
+#JNI 路径
+set(JNI_PATH ${CMAKE_SOURCE_DIR})
 
-             # Sets the library as a shared library.
-             SHARED
+# 其它动态库路径
+# 动态库 路径
+set(SHARED_PATH ${CMAKE_SOURCE_DIR}/../jniLibs/${CMAKE_ANDROID_ARCH_ABI})
 
-             # Provides a relative path to your source file(s).
-             native-lib.cpp )
 
-# Searches for a specified prebuilt library and stores the path as a
-# variable. Because CMake includes system libraries in the search path by
-# default, you only need to specify the name of the public NDK library
-# you want to add. CMake verifies that the library exists before
-# completing its build.
+include_directories(${JNI_PATH}/include)
 
-find_library( # Sets the name of the path variable.
-              log-lib
 
-              # Specifies the name of the NDK library that
-              # you want CMake to locate.
-              log )
+#jni cpp
+FILE(GLOB JNI_ALL_CPP ${JNI_PATH}/*.cpp)
+FILE(GLOB JNI_ALL_H ${JNI_PATH}/*.h)
 
-# Specifies libraries CMake should link to your target library. You
-# can link multiple libraries, such as libraries you define in this
-# build script, prebuilt third-party libraries, or system libraries.
+#-------------------------------------------------加载库文件----------------------------------------------
 
-target_link_libraries( # Specifies the target library.
-                       native-lib
 
-                       # Links the target library to the log library
-                       # included in the NDK.
-                       ${log-lib} )
+add_library(unwind SHARED IMPORTED)
+set_target_properties(unwind PROPERTIES IMPORTED_LOCATION ${SHARED_PATH}/libunwind.so)
+
+add_library(unwind-aarch64 SHARED IMPORTED)
+set_target_properties(unwind-aarch64 PROPERTIES IMPORTED_LOCATION ${SHARED_PATH}/libunwind-aarch64.so)
+
+add_library(unwind-ptrace SHARED IMPORTED)
+set_target_properties(unwind-ptrace PROPERTIES IMPORTED_LOCATION ${SHARED_PATH}/libunwind-ptrace.so)
+
+add_library(unwind-setjmp SHARED IMPORTED)
+set_target_properties(unwind-setjmp PROPERTIES IMPORTED_LOCATION ${SHARED_PATH}/libunwind-setjmp.so)
+
+add_library(
+        native-lib
+        SHARED
+        ${JNI_ALL_CPP}
+)
+
+
+find_library(
+        log-lib
+        log
+)
+
+
+#AVTools
+target_link_libraries(
+        native-lib
+        unwind
+        unwind-aarch64
+        unwind-ptrace
+        unwind-setjmp
+        ${log-lib}
+)

@@ -14,9 +14,13 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
             cmake {
-                cppFlags ""
+                arguments "-DANDROID_STL=c++_shared"
+                abiFilters "arm64-v8a"
+                cFlags "-DSTDC_HEADERS"/* -DSTDC_HEADERS*/
+                cppFlags "-std=c++11"
             }
         }
+
     }
 
     buildTypes {
@@ -25,12 +29,19 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
+
     externalNativeBuild {
         cmake {
-            path "src/main/cpp/CMakeLists.txt"
-            version "3.10.2"
+            path file('src/main/cpp/CMakeLists.txt')
         }
     }
+
+    packagingOptions {
+
+        pickFirst 'lib/arm64-v8a/*.so'
+    }
+
+
 }
 
 dependencies {

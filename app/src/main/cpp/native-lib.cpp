@@ -20,6 +20,8 @@
 
 //保存最终的日志信息
 char stack_log[2048];
+//线程名称
+char * thread_name;
 
 JavaVM *g_jvm;
 jobject g_obj;
@@ -32,6 +34,8 @@ struct sigaction *p_sa_old;
 //线程控制
 static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+
+#define THREAD_NAME_LENGTH 100
 
 //信号最多个数
 #define SIG_NUMBER_MAX 32
@@ -272,6 +276,35 @@ static const char *sig_desc(int sig, int code) {
     }
 }
 
+/**
+ * 获取线程名称
+ * @param tid
+ * @return
+ */
+static char *get_thread_name(pid_t tid) {
+
+    if (tid <= 1) {
+        return NULL;
+    }
+    char *path = (char *) calloc(1, 80);
+    char *line = (char *) calloc(1, THREAD_NAME_LENGTH);
+
+    snprintf(path, PATH_MAX, "proc/%d/comm", tid);
+    FILE *commFile = NULL;
+    if (commFile = fopen(path, "r")) {
+        fgets(line, THREAD_NAME_LENGTH, commFile);
+        fclose(commFile);
+    }
+    free(path);
+    if (line) {
+        int length = strlen(line);
+        if (line[length - 1] == '\n') {
+            line[length - 1] = '\0';
+        }
+    }
+    return line;
+}
+
 
 /**
  * 信号对应的处理函数
@@ -291,6 +324,12 @@ static void sig_handler(const int code, siginfo *siginfo, void *context) {
 
     //开始解堆栈
     slow_backtrace();
+    pid_t tid = gettid();
+    pthread_t t = pthread_self();
+    LOGE("pid_t = %d, pthread_self = %d", tid, t);
+    //获取线程名称
+    thread_name = get_thread_name(tid);
+
 
     //通知等待信号的线程
     pthread_mutex_lock(&mtx);
@@ -339,6 +378,7 @@ static int register_crash_handler() {
 
 }
 
+
 /**
  * 在信号处理函数中回调Java方法总是失败，所以在新线程中回调Java方法
  * @param argv
@@ -366,12 +406,15 @@ void *dumpStack(void *argv) {
         LOGE("开始将堆栈回调到Java层");
         //将堆栈发送到Java层
         jclass clz = env->GetObjectClass(g_obj);
-        jmethodID jmethodId = env->GetStaticMethodID(clz, "onNativeLog", "(Ljava/lang/String;)V");
+        jmethodID jmethodId = env->GetStaticMethodID(clz, "onNativeLog", "(Ljava/lang/String;Ljava/lang/String;)V");
         jstring jstack = env->NewStringUTF(stack_temp);
 
         //释放资源
         free(stack_temp);
-        env->CallStaticVoidMethod(clz, jmethodId, jstack);
+        if (thread_name == nullptr) {
+            thread_name = "";
+        }
+        env->CallStaticVoidMethod(clz, jmethodId, jstack, env->NewStringUTF(thread_name));
         env->DeleteLocalRef(jstack);
 
 

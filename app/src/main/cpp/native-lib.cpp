@@ -4,6 +4,8 @@
 #include <android/log.h>
 #include <libunwind-aarch64.h>
 #include <dlfcn.h>
+#include <unistd.h>
+#include <pthread.h>
 
 
 #define TAG "crash_sdk_jni" // 这个是自定义的LOG的标识
@@ -16,8 +18,20 @@
 #define ERROR -1
 #define SUCCESS 0;
 
+//保存最终的日志信息
+char stack_log[2048];
+
+JavaVM *g_jvm;
+jobject g_obj;
+//是否停止
+bool b_stop = false;
+
 //保存之前的信号处理结构体
 struct sigaction *p_sa_old;
+
+//线程控制
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 
 //信号最多个数
 #define SIG_NUMBER_MAX 32
@@ -32,48 +46,57 @@ static const int sig_arr[SIG_CATCH_COUNT] = {SIGABRT,  //进程发现错误或�
                                              SIGSEGV}; //段地址错误，比如空指针、数组越界、野指针等
 
 
+
+
+
+/**
+ * 追加数据
+ * @param des
+ * @param src
+ */
+static void append(char *des, char *src) {
+    if (des == nullptr || src == nullptr) return;
+    pthread_mutex_lock(&mtx);
+    strcat(des, src);
+    strcat(des, "\n");
+    pthread_mutex_unlock(&mtx);
+}
+
+
 /**
  * 使用unwind解析堆栈
- * @param buffer
- * @param size
- * @param uc
  * @return
  */
-static int slow_backtrace(unw_word_t **buffer, int size, unw_context_t *uc) {
+static int slow_backtrace() {
+    unw_context_t uc;
+    unw_getcontext (&uc);
+
     unw_cursor_t cursor;
     unw_word_t pc;
-    int n = 0;
 
-    LOGE("开始slow_backtrace");
-    if (unw_init_local(&cursor, uc) < 0)
-        return 0;
-    LOGE("unw_init_local 初始化成功");
+    if (unw_init_local(&cursor, &uc) < 0)
+        return ERROR;
 
     while (unw_step(&cursor) > 0) {
-        LOGE("unw_step 成功");
-        if (n >= size)
-            return n;
+
         if (unw_get_reg(&cursor, UNW_REG_IP, &pc) < 0)
-            return n;
+            return ERROR;
         //尝试获取动态库的信息
         Dl_info info;
-        dladdr ((void*)pc, &info);
-        LOGE("dladdr获取动态库的名字：%s", info.dli_fname);
-
-//        Dl_info info;
-//        unw_word_t *addr = &pc;
-//        if (dladdr(addr, &info) != 0) {
-//            LOGE("dladdr获取成功，动态库的名字：%s", info.dli_fname);
-//
-//        } else{
-//            char* err_msg = dlerror();
-//            LOGE("dladdr获取失败，信息:%s", err_msg);
-//        }
-        LOGE("unw_get_reg 成功");
-        buffer[n++] = &pc;
+        if (dladdr((void *) pc, &info) != 0) {
+            void *const nearest = info.dli_saddr;
+            //相对偏移地址
+            const uintptr_t addr_relative =
+                    ((uintptr_t) pc - (uintptr_t) info.dli_fbase);
+            char log[1024];
+            snprintf(log, sizeof(log), "at %s(%s）", info.dli_fname, info.dli_sname);
+            append(stack_log, log);
+//            addr2line()
+        }
     }
-    return n;
+    return SUCCESS;
 }
+
 
 /**
  * 对于不同的信号和code 返回不同的描述
@@ -261,19 +284,23 @@ static void sig_handler(const int code, siginfo *siginfo, void *context) {
 
     LOGE("收到信号对应的code:%d, si_code:%d，错误信息：%s", code, siginfo->si_code,
          sig_desc(code, siginfo->si_code));
-    //开始我们自己的信号处理
-    unw_word_t *buf[20];
-    unw_context_t uc;
-    unw_getcontext (&uc);
+    //要返回的堆栈日志
+    char log[1024];
+    snprintf(log, sizeof(log), "signal %d （%s）", code, sig_desc(code, siginfo->si_code));
+    append(stack_log, log);
 
-    int n = slow_backtrace(buf, 20, &uc);
+    //开始解堆栈
+    slow_backtrace();
+
+    //通知等待信号的线程
+    pthread_mutex_lock(&mtx);
+    pthread_cond_signal(&cond);
+    pthread_mutex_unlock(&mtx);
+
     //据pc的值，获取动态库的起始地址
-
-
     //据code找到之前的信号处理
     struct sigaction old_sig_act = p_sa_old[code];
     //调用之前的处理
-    LOGE("调用之前的信号处理");
     old_sig_act.sa_sigaction(code, siginfo, context);
 
 }
@@ -300,11 +327,6 @@ static int register_crash_handler() {
     //分配保存之前的信号处理结构体的内存
     p_sa_old = static_cast<struct sigaction *>(calloc(sizeof(struct sigaction), SIG_NUMBER_MAX));
 
-    //注册要处理的信号
-//    if (sigaction(sig, &sa, nullptr) != 0){
-//        return ERROR;
-//    }
-
     for (int i = 0; sig_arr[i] != 0; i++) {
         int sig = sig_arr[i];
         if (sigaction(sig, &sa, &p_sa_old[sig]) != 0) {
@@ -317,18 +339,74 @@ static int register_crash_handler() {
 
 }
 
+/**
+ * 在信号处理函数中回调Java方法总是失败，所以在新线程中回调Java方法
+ * @param argv
+ * @return
+ */
+void *dumpStack(void *argv) {
+    //将当前线程attach到虚拟机
+    JNIEnv *env;
+    if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+        LOGE("当前线程AttachCurrentThread失败");
+        return nullptr;
+    }
+
+
+    while (!b_stop) {
+        //等待信号
+        char *stack_temp;
+        pthread_mutex_lock(&mtx);
+        pthread_cond_wait(&cond, &mtx);
+        LOGE("开始将堆栈拷贝到局部变量");
+        stack_temp = static_cast<char *>(malloc(sizeof(stack_log)));
+        strcpy(stack_temp, stack_log);
+        pthread_mutex_unlock(&mtx);
+
+        LOGE("开始将堆栈回调到Java层");
+        //将堆栈发送到Java层
+        jclass clz = env->GetObjectClass(g_obj);
+        jmethodID jmethodId = env->GetStaticMethodID(clz, "onNativeLog", "(Ljava/lang/String;)V");
+        jstring jstack = env->NewStringUTF(stack_temp);
+
+        //释放资源
+        free(stack_temp);
+        env->CallStaticVoidMethod(clz, jmethodId, jstack);
+        env->DeleteLocalRef(jstack);
+
+
+    }
+
+}
+
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_example_crashsdk_MainActivity_stringFromJNI(
-        JNIEnv *env,
-        jobject /* this */) {
+Java_com_example_crashsdk_MainActivity_stringFromJNI(JNIEnv *env, jobject thiz, jobject crash_log) {
     std::string hello = "Hello from C++";
+    return env->NewStringUTF(hello.c_str());
+}
 
-    //开始注册
-    register_crash_handler();
+jint JNI_OnLoad(JavaVM *vm, void *reserved) {
+    g_jvm = vm;//获取一个全局的VM指针
+    return JNI_VERSION_1_6;
+}
 
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_example_crashsdk_MainActivity_initCrashSDK(JNIEnv *env, jobject thiz, jobject crash_log) {
+    //创建一个全局的引用
+    g_obj = env->NewGlobalRef(crash_log);
+    //开启子线程，等待信号
+    pthread_t tid;
+    int ret = pthread_create(&tid, nullptr, dumpStack, nullptr);
+    if (ret) {
+        return ret;
+    }
+    //注册崩溃处理程序
+    ret = register_crash_handler();
+
+    //触发崩溃
     char *name = nullptr;
     strlen(name);
-
-    return env->NewStringUTF(hello.c_str());
+    return ret;
 }
